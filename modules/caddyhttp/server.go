@@ -150,7 +150,7 @@ type Server struct {
 
 // ServeHTTP is the entry point for all HTTP requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "Caddy")
+	w.Header().Set("Server", "DATAMIX.DEV")
 
 	if s.h3server != nil {
 		err := s.h3server.SetQuicHeaders(w.Header())
