@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -88,11 +89,19 @@ func ListenPacket(network, addr string) (net.PacketConn, error) {
 // ListenQUIC returns a quic.EarlyListener suitable for use in a Caddy module.
 // Note that the context passed to Accept is currently ignored, so using
 // a context other than context.Background is meaningless.
-func ListenQUIC(addr string, tlsConf *tls.Config) (quic.EarlyListener, error) {
+func ListenQUIC(addr string, tlsConf *tls.Config, activeRequests *int64) (quic.EarlyListener, error) {
 	lnKey := listenerKey("udp", addr)
 
 	sharedEl, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
-		el, err := quic.ListenAddrEarly(addr, http3.ConfigureTLSConfig(tlsConf), &quic.Config{})
+		el, err := quic.ListenAddrEarly(addr, http3.ConfigureTLSConfig(tlsConf), &quic.Config{
+			RequireAddressValidation: func(clientAddr net.Addr) bool {
+				var highLoad bool
+				if activeRequests != nil {
+					highLoad = atomic.LoadInt64(activeRequests) > 1000 // TODO: make tunable?
+				}
+				return highLoad
+			},
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -392,7 +401,7 @@ func (na NetworkAddress) isLoopback() bool {
 	if na.Host == "localhost" {
 		return true
 	}
-	if ip := net.ParseIP(na.Host); ip != nil {
+	if ip, err := netip.ParseAddr(na.Host); err == nil {
 		return ip.IsLoopback()
 	}
 	return false
@@ -402,7 +411,7 @@ func (na NetworkAddress) isWildcardInterface() bool {
 	if na.Host == "" {
 		return true
 	}
-	if ip := net.ParseIP(na.Host); ip != nil {
+	if ip, err := netip.ParseAddr(na.Host); err == nil {
 		return ip.IsUnspecified()
 	}
 	return false
