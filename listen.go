@@ -1,9 +1,26 @@
-//go:build !linux
+// Copyright 2015 Matthew Holt and The Caddy Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// TODO: Go 1.19 introduced the "unix" build tag. We have to support Go 1.18 until Go 1.20 is released.
+// When Go 1.19 is our minimum, change this build tag to simply "!unix".
+// (see similar change needed in listen_unix.go)
+//go:build !(aix || android || darwin || dragonfly || freebsd || hurd || illumos || ios || linux || netbsd || openbsd || solaris)
 
 package caddy
 
 import (
-	"fmt"
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -12,21 +29,14 @@ import (
 	"go.uber.org/zap"
 )
 
-func ListenTimeout(network, addr string, keepAlivePeriod time.Duration) (net.Listener, error) {
-	// check to see if plugin provides listener
-	if ln, err := getListenerFromPlugin(network, addr); err != nil || ln != nil {
-		return ln, err
-	}
+func reuseUnixSocket(network, addr string) (any, error) {
+	return nil, nil
+}
 
-	lnKey := listenerKey(network, addr)
-
+func listenTCPOrUnix(ctx context.Context, lnKey string, network, address string, config net.ListenConfig) (net.Listener, error) {
 	sharedLn, _, err := listenerPool.LoadOrNew(lnKey, func() (Destructor, error) {
-		ln, err := net.Listen(network, addr)
+		ln, err := config.Listen(ctx, network, address)
 		if err != nil {
-			// https://github.com/caddyserver/caddy/pull/4534
-			if isUnixNetwork(network) && isListenBindAddressAlreadyInUseError(err) {
-				return nil, fmt.Errorf("%w: this can happen if Caddy was forcefully killed", err)
-			}
 			return nil, err
 		}
 		return &sharedListener{Listener: ln, key: lnKey}, nil
@@ -34,8 +44,7 @@ func ListenTimeout(network, addr string, keepAlivePeriod time.Duration) (net.Lis
 	if err != nil {
 		return nil, err
 	}
-
-	return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener), keepAlivePeriod: keepAlivePeriod}, nil
+	return &fakeCloseListener{sharedListener: sharedLn.(*sharedListener), keepAlivePeriod: config.KeepAlive}, nil
 }
 
 // fakeCloseListener is a private wrapper over a listener that
@@ -139,8 +148,6 @@ func (sl *sharedListener) clearDeadline() error {
 		switch ln := sl.Listener.(type) {
 		case *net.TCPListener:
 			err = ln.SetDeadline(time.Time{})
-		case *net.UnixListener:
-			err = ln.SetDeadline(time.Time{})
 		}
 		sl.deadline = false
 	}
@@ -155,8 +162,6 @@ func (sl *sharedListener) setDeadline() error {
 	if !sl.deadline {
 		switch ln := sl.Listener.(type) {
 		case *net.TCPListener:
-			err = ln.SetDeadline(timeInPast)
-		case *net.UnixListener:
 			err = ln.SetDeadline(timeInPast)
 		}
 		sl.deadline = true

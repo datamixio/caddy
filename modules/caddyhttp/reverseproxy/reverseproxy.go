@@ -217,7 +217,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	h.events = eventAppIface.(*caddyevents.App)
 	h.ctx = ctx
-	h.logger = ctx.Logger(h)
+	h.logger = ctx.Logger()
 	h.connections = make(map[io.ReadWriteCloser]openConnection)
 	h.connectionsMu = new(sync.Mutex)
 
@@ -782,8 +782,9 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 				copyHeader(h, http.Header(header))
 				rw.WriteHeader(code)
 
-				// Clear headers, it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses
-				for k := range h {
+				// Clear headers coming from the backend
+				// (it's not automatically done by ResponseWriter.WriteHeader() for 1xx responses)
+				for k := range header {
 					delete(h, k)
 				}
 

@@ -4,6 +4,7 @@ before:
     # This is so we can run goreleaser on tag without Git complaining of being dirty. The main.go in cmd/caddy directory 
     # cannot be built within that directory due to changes necessary for the build causing Git to be dirty, which
     # subsequently causes gorleaser to refuse running.
+    - rm -rf caddy-build caddy-dist
     - mkdir -p caddy-build
     - cp cmd/caddy/main.go caddy-build/main.go
     - /bin/sh -c 'cd ./caddy-build && go mod init caddy'
@@ -68,12 +69,15 @@ builds:
 signs:
   - cmd: cosign
     signature: "${artifact}.sig"
-    args: ["sign-blob", "--oidc-issuer=https://token.actions.githubusercontent.com", "--output=${signature}", "${artifact}"]
+    certificate: '{{ trimsuffix (trimsuffix .Env.artifact ".zip") ".tar.gz" }}.pem'
+    args: ["sign-blob", "--output-signature=${signature}", "--output-certificate", "${certificate}", "${artifact}"]
     artifacts: all
 sboms:
   - artifacts: binary
+    documents:
+    - '{{ .Binary }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{if .Arm}}v{{ .Arm }}{{end}}.sbom'
     cmd: syft
-    args: ["$artifact", "--file", "$sbom", "--output", "cyclonedx-json"]
+    args: ["$artifact", "--file", "${document}", "--output", "cyclonedx-json"]
 archives:
   - format_overrides:
       - goos: windows

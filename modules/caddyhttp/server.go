@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -153,6 +152,10 @@ type Server struct {
 	// Default: `[h1 h2 h3]`
 	Protocols []string `json:"protocols,omitempty"`
 
+	// If set, metrics observations will be enabled.
+	// This setting is EXPERIMENTAL and subject to change.
+	Metrics *Metrics `json:"metrics,omitempty"`
+
 	name string
 
 	primaryHandlerChain Handler
@@ -167,12 +170,18 @@ type Server struct {
 	errorLogger  *zap.Logger
 	ctx          caddy.Context
 
-	server    *http.Server
-	h3server  *http3.Server
-	addresses []caddy.NetworkAddress
+	server      *http.Server
+	h3server    *http3.Server
+	h3listeners []net.PacketConn // TODO: we have to hold these because quic-go won't close listeners it didn't create
+	addresses   []caddy.NetworkAddress
 
 	shutdownAt   time.Time
 	shutdownAtMu *sync.RWMutex
+
+	// registered callback functions
+	connStateFuncs   []func(net.Conn, http.ConnState)
+	connContextFuncs []func(ctx context.Context, c net.Conn) context.Context
+	onShutdownFuncs  []func()
 }
 
 // ServeHTTP is the entry point for all HTTP requests.
@@ -181,13 +190,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// advertise HTTP/3, if enabled
 	if s.h3server != nil {
-		// keep track of active requests for QUIC transport purposes (See AcceptToken callback in quic.Config)
+		// keep track of active requests for QUIC transport purposes
 		atomic.AddInt64(&s.activeRequests, 1)
 		defer atomic.AddInt64(&s.activeRequests, -1)
 
-		err := s.h3server.SetQuicHeaders(w.Header())
-		if err != nil {
-			s.logger.Error("setting HTTP/3 Alt-Svc header", zap.Error(err))
+		if r.ProtoMajor < 3 {
+			err := s.h3server.SetQuicHeaders(w.Header())
+			if err != nil {
+				s.logger.Error("setting HTTP/3 Alt-Svc header", zap.Error(err))
+			}
 		}
 	}
 
@@ -226,7 +237,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accLog := s.accessLogger.With(loggableReq)
 
 		defer func() {
-			repl.Set("http.response.status", wrec.Status())
+			// this request may be flagged as omitted from the logs
+			if skipLog, ok := GetVar(r.Context(), SkipLogVar).(bool); ok && skipLog {
+				return
+			}
+
+			repl.Set("http.response.status", wrec.Status()) // will be 0 if no response is written by us (Go will write 200 to client)
 			repl.Set("http.response.size", wrec.Size())
 			repl.Set("http.response.duration", duration)
 			repl.Set("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
@@ -480,8 +496,27 @@ func (s *Server) findLastRouteWithHostMatcher() int {
 // serveHTTP3 creates a QUIC listener, configures an HTTP/3 server if
 // not already done, and then uses that server to serve HTTP/3 over
 // the listener, with Server s as the handler.
-func (s *Server) serveHTTP3(hostport string, tlsCfg *tls.Config) error {
-	h3ln, err := caddy.ListenQUIC(hostport, tlsCfg, &s.activeRequests)
+func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error {
+	switch addr.Network {
+	case "unix":
+		addr.Network = "unixgram"
+	case "tcp":
+		addr.Network = "udp"
+	case "tcp4":
+		addr.Network = "udp4"
+	case "tcp6":
+		addr.Network = "udp6"
+	default:
+		return fmt.Errorf("unsure what network to use for HTTP/3 given network type: %s", addr.Network)
+	}
+
+	lnAny, err := addr.Listen(s.ctx, 0, net.ListenConfig{})
+	if err != nil {
+		return err
+	}
+	ln := lnAny.(net.PacketConn)
+
+	h3ln, err := caddy.ListenQUIC(ln, tlsCfg, &s.activeRequests)
 	if err != nil {
 		return fmt.Errorf("starting HTTP/3 QUIC listener: %v", err)
 	}
@@ -499,10 +534,57 @@ func (s *Server) serveHTTP3(hostport string, tlsCfg *tls.Config) error {
 		}
 	}
 
+	s.h3listeners = append(s.h3listeners, lnAny.(net.PacketConn))
+
 	//nolint:errcheck
 	go s.h3server.ServeListener(h3ln)
 
 	return nil
+}
+
+// configureServer applies/binds the registered callback functions to the server.
+func (s *Server) configureServer(server *http.Server) {
+	for _, f := range s.connStateFuncs {
+		if server.ConnState != nil {
+			baseConnStateFunc := server.ConnState
+			server.ConnState = func(conn net.Conn, state http.ConnState) {
+				baseConnStateFunc(conn, state)
+				f(conn, state)
+			}
+		} else {
+			server.ConnState = f
+		}
+	}
+
+	for _, f := range s.connContextFuncs {
+		if server.ConnContext != nil {
+			baseConnContextFunc := server.ConnContext
+			server.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+				return f(baseConnContextFunc(ctx, c), c)
+			}
+		} else {
+			server.ConnContext = f
+		}
+	}
+
+	for _, f := range s.onShutdownFuncs {
+		server.RegisterOnShutdown(f)
+	}
+}
+
+// RegisterConnState registers f to be invoked on s.ConnState.
+func (s *Server) RegisterConnState(f func(net.Conn, http.ConnState)) {
+	s.connStateFuncs = append(s.connStateFuncs, f)
+}
+
+// RegisterConnContext registers f to be invoked as part of s.ConnContext.
+func (s *Server) RegisterConnContext(f func(ctx context.Context, c net.Conn) context.Context) {
+	s.connContextFuncs = append(s.connContextFuncs, f)
+}
+
+// RegisterOnShutdown registers f to be invoked on server shutdown.
+func (s *Server) RegisterOnShutdown(f func()) {
+	s.onShutdownFuncs = append(s.onShutdownFuncs, f)
 }
 
 // HTTPErrorConfig determines how to handle errors
@@ -592,96 +674,6 @@ func (s *Server) protocol(proto string) bool {
 // EXPERIMENTAL: Subject to change or removal.
 func (s *Server) Listeners() []net.Listener { return s.listeners }
 
-// ServerLogConfig describes a server's logging configuration. If
-// enabled without customization, all requests to this server are
-// logged to the default logger; logger destinations may be
-// customized per-request-host.
-type ServerLogConfig struct {
-	// The default logger name for all logs emitted by this server for
-	// hostnames that are not in the LoggerNames (logger_names) map.
-	DefaultLoggerName string `json:"default_logger_name,omitempty"`
-
-	// LoggerNames maps request hostnames to a custom logger name.
-	// For example, a mapping of "example.com" to "example" would
-	// cause access logs from requests with a Host of example.com
-	// to be emitted by a logger named "http.log.access.example".
-	LoggerNames map[string]string `json:"logger_names,omitempty"`
-
-	// By default, all requests to this server will be logged if
-	// access logging is enabled. This field lists the request
-	// hosts for which access logging should be disabled.
-	SkipHosts []string `json:"skip_hosts,omitempty"`
-
-	// If true, requests to any host not appearing in the
-	// LoggerNames (logger_names) map will not be logged.
-	SkipUnmappedHosts bool `json:"skip_unmapped_hosts,omitempty"`
-
-	// If true, credentials that are otherwise omitted, will be logged.
-	// The definition of credentials is defined by https://fetch.spec.whatwg.org/#credentials,
-	// and this includes some request and response headers, i.e `Cookie`,
-	// `Set-Cookie`, `Authorization`, and `Proxy-Authorization`.
-	ShouldLogCredentials bool `json:"should_log_credentials,omitempty"`
-}
-
-// wrapLogger wraps logger in a logger named according to user preferences for the given host.
-func (slc ServerLogConfig) wrapLogger(logger *zap.Logger, host string) *zap.Logger {
-	if loggerName := slc.getLoggerName(host); loggerName != "" {
-		return logger.Named(loggerName)
-	}
-	return logger
-}
-
-func (slc ServerLogConfig) getLoggerName(host string) string {
-	tryHost := func(key string) (string, bool) {
-		// first try exact match
-		if loggerName, ok := slc.LoggerNames[key]; ok {
-			return loggerName, ok
-		}
-		// strip port and try again (i.e. Host header of "example.com:1234" should
-		// match "example.com" if there is no "example.com:1234" in the map)
-		hostOnly, _, err := net.SplitHostPort(key)
-		if err != nil {
-			return "", false
-		}
-		loggerName, ok := slc.LoggerNames[hostOnly]
-		return loggerName, ok
-	}
-
-	// try the exact hostname first
-	if loggerName, ok := tryHost(host); ok {
-		return loggerName
-	}
-
-	// try matching wildcard domains if other non-specific loggers exist
-	labels := strings.Split(host, ".")
-	for i := range labels {
-		if labels[i] == "" {
-			continue
-		}
-		labels[i] = "*"
-		wildcardHost := strings.Join(labels, ".")
-		if loggerName, ok := tryHost(wildcardHost); ok {
-			return loggerName
-		}
-	}
-
-	return slc.DefaultLoggerName
-}
-
-func (slc *ServerLogConfig) clone() *ServerLogConfig {
-	clone := &ServerLogConfig{
-		DefaultLoggerName:    slc.DefaultLoggerName,
-		LoggerNames:          make(map[string]string),
-		SkipHosts:            append([]string{}, slc.SkipHosts...),
-		SkipUnmappedHosts:    slc.SkipUnmappedHosts,
-		ShouldLogCredentials: slc.ShouldLogCredentials,
-	}
-	for k, v := range slc.LoggerNames {
-		clone.LoggerNames[k] = v
-	}
-	return clone
-}
-
 // PrepareRequest fills the request r for use in a Caddy HTTP handler chain. w and s can
 // be nil, but the handlers will lose response placeholders and access to the server.
 func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter, s *Server) *http.Request {
@@ -699,31 +691,6 @@ func PrepareRequest(r *http.Request, repl *caddy.Replacer, w http.ResponseWriter
 	addHTTPVarsToReplacer(repl, r, w)
 
 	return r
-}
-
-// errLogValues inspects err and returns the status code
-// to use, the error log message, and any extra fields.
-// If err is a HandlerError, the returned values will
-// have richer information.
-func errLogValues(err error) (status int, msg string, fields []zapcore.Field) {
-	var handlerErr HandlerError
-	if errors.As(err, &handlerErr) {
-		status = handlerErr.StatusCode
-		if handlerErr.Err == nil {
-			msg = err.Error()
-		} else {
-			msg = handlerErr.Err.Error()
-		}
-		fields = []zapcore.Field{
-			zap.Int("status", handlerErr.StatusCode),
-			zap.String("err_id", handlerErr.ID),
-			zap.String("err_trace", handlerErr.Trace),
-		}
-		return
-	}
-	status = http.StatusInternalServerError
-	msg = err.Error()
-	return
 }
 
 // originalRequest returns a partial, shallow copy of

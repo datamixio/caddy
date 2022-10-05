@@ -95,11 +95,13 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
 		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
 		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
+		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
 		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
 		{regexp.MustCompile(`{re\.([\w-]*)\.([\w-]*)}`), "{http.regexp.$1.$2}"},
 		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
 		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
 		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
+		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
 	}
 
 	for _, sb := range originalServerBlocks {
@@ -221,7 +223,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 			hasDefaultLog = true
 		}
 		if _, ok := options["debug"]; ok && ncl.log.Level == "" {
-			ncl.log.Level = "DEBUG"
+			ncl.log.Level = zap.DebugLevel.CapitalString()
 		}
 		customLogs = append(customLogs, ncl)
 	}
@@ -239,7 +241,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		if _, ok := options["debug"]; ok {
 			customLogs = append(customLogs, namedCustomLog{
 				name: "default",
-				log:  &caddy.CustomLog{Level: "DEBUG"},
+				log:  &caddy.CustomLog{Level: zap.DebugLevel.CapitalString()},
 			})
 		}
 	}
@@ -953,7 +955,7 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 func buildSubroute(routes []ConfigValue, groupCounter counter) (*caddyhttp.Subroute, error) {
 	for _, val := range routes {
 		if !directiveIsOrdered(val.directive) {
-			return nil, fmt.Errorf("directive '%s' is not ordered, so it cannot be used here", val.directive)
+			return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here", val.directive)
 		}
 	}
 

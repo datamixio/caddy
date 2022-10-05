@@ -43,6 +43,7 @@ type serverOptions struct {
 	Protocols            []string
 	StrictSNIHost        *bool
 	ShouldLogCredentials bool
+	Metrics              *caddyhttp.Metrics
 }
 
 func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
@@ -161,7 +162,7 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 					}
 					serverOpts.Protocols = append(serverOpts.Protocols, proto)
 				}
-				if d.NextBlock(0) {
+				if nesting := d.Nesting(); d.NextBlock(nesting) {
 					return nil, d.ArgErr()
 				}
 
@@ -174,6 +175,15 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 					boolVal = false
 				}
 				serverOpts.StrictSNIHost = &boolVal
+
+			case "metrics":
+				if d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				if d.NextBlock(0) {
+					return nil, d.ArgErr()
+				}
+				serverOpts.Metrics = new(caddyhttp.Metrics)
 
 			// TODO: DEPRECATED. (August 2022)
 			case "protocol":
@@ -259,6 +269,7 @@ func applyServerOptions(
 		server.MaxHeaderBytes = opts.MaxHeaderBytes
 		server.Protocols = opts.Protocols
 		server.StrictSNIHost = opts.StrictSNIHost
+		server.Metrics = opts.Metrics
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
 				server.Logs = &caddyhttp.ServerLogConfig{}
