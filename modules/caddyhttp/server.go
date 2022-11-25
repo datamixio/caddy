@@ -500,14 +500,12 @@ func (s *Server) serveHTTP3(addr caddy.NetworkAddress, tlsCfg *tls.Config) error
 	switch addr.Network {
 	case "unix":
 		addr.Network = "unixgram"
-	case "tcp":
-		addr.Network = "udp"
 	case "tcp4":
 		addr.Network = "udp4"
 	case "tcp6":
 		addr.Network = "udp6"
 	default:
-		return fmt.Errorf("unsure what network to use for HTTP/3 given network type: %s", addr.Network)
+		addr.Network = "udp" // TODO: Maybe a better default is to not enable HTTP/3 if we do not know the network?
 	}
 
 	lnAny, err := addr.Listen(s.ctx, 0, net.ListenConfig{})
@@ -639,21 +637,18 @@ func (s *Server) shouldLogRequest(r *http.Request) bool {
 		// logging is disabled
 		return false
 	}
+	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
+		// this host is mapped to a particular logger name
+		return true
+	}
 	for _, dh := range s.Logs.SkipHosts {
 		// logging for this particular host is disabled
 		if certmagic.MatchWildcard(r.Host, dh) {
 			return false
 		}
 	}
-	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
-		// this host is mapped to a particular logger name
-		return true
-	}
-	if s.Logs.SkipUnmappedHosts {
-		// this host is not mapped and thus must not be logged
-		return false
-	}
-	return true
+	// if configured, this host is not mapped and thus must not be logged
+	return !s.Logs.SkipUnmappedHosts
 }
 
 // protocol returns true if the protocol proto is configured/enabled.

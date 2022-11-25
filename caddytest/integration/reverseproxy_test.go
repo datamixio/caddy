@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/caddytest"
 )
@@ -435,12 +436,13 @@ func TestReverseProxyHealthCheck(t *testing.T) {
 	
 			health_uri /health
 			health_port 2021
-			health_interval 2s
-			health_timeout 5s
+			health_interval 10ms
+			health_timeout 100ms
 		}
 	}
   `, "caddyfile")
 
+	time.Sleep(100 * time.Millisecond) // TODO: for some reason this test seems particularly flaky, getting 503 when it should be 200, unless we wait
 	tester.AssertGetResponse("http://localhost:9080/", 200, "Hello, World!")
 }
 
